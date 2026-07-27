@@ -34,62 +34,63 @@ def equirectangular_to_perspective(
         Perspective-cropped view as PIL.Image
     """
     pano_w, pano_h = panorama.size
-    fov_rad = math.radians(fov)
-    half_fov = fov_rad / 2
+    half_fov = math.radians(fov) / 2
+    cos_h, sin_h = math.cos(math.radians(heading)), math.sin(math.radians(heading))
+    cos_p, sin_p = math.cos(math.radians(pitch)), math.sin(math.radians(pitch))
+    tan_hfov = math.tan(half_fov)
 
-    # Output pixel coordinates to ray directions
-    out = Image.new("RGB", (output_size, output_size))
     pano_arr = np.array(panorama)
 
-    heading_rad = math.radians(heading)
-    pitch_rad = math.radians(pitch)
+    # Build grid of output pixel coords
+    px = np.arange(output_size)
+    py = np.arange(output_size)
+    gx, gy = np.meshgrid(px, py)
 
-    for py in range(output_size):
-        for px in range(output_size):
-            # Normalized coordinates [-1, 1]
-            nx = (px + 0.5) / output_size * 2 - 1
-            ny = (py + 0.5) / output_size * 2 - 1
+    # Normalized coords [-1, 1]
+    nx = (gx + 0.5) / output_size * 2 - 1
+    ny = (gy + 0.5) / output_size * 2 - 1
 
-            # Ray direction in camera space
-            dx = math.tan(half_fov) * nx
-            dy = math.tan(half_fov) * ny
-            dz = 1.0
+    # Ray directions in camera space
+    dx = tan_hfov * nx
+    dy = tan_hfov * ny
+    dz = np.ones_like(dx)
 
-            # Rotate by pitch (around x-axis)
-            cos_p, sin_p = math.cos(pitch_rad), math.sin(pitch_rad)
-            dy2 = dy * cos_p - dz * sin_p
-            dz2 = dy * sin_p + dz * cos_p
+    # Rotate by pitch (around x-axis)
+    dy2 = dy * cos_p - dz * sin_p
+    dz2 = dy * sin_p + dz * cos_p
 
-            # Rotate by heading (around y-axis)
-            cos_h, sin_h = math.cos(heading_rad), math.sin(heading_rad)
-            dx3 = dx * cos_h + dz2 * sin_h
-            dz3 = -dx * sin_h + dz2 * cos_h
+    # Rotate by heading (around y-axis)
+    dx3 = dx * cos_h + dz2 * sin_h
+    dz3 = -dx * sin_h + dz2 * cos_h
 
-            # Convert to equirectangular coordinates
-            lon = math.atan2(dx3, dz3)
-            lat = math.atan2(-dy2, math.sqrt(dx3**2 + dz3**2))
+    # Convert to equirectangular coordinates
+    lon = np.arctan2(dx3, dz3)
+    lat = np.arctan2(-dy2, np.sqrt(dx3**2 + dz3**2 + 1e-10))
 
-            # Map to pixel coordinates
-            equirect_x = (lon / math.pi + 1) / 2 * pano_w
-            equirect_y = (lat / math.pi + 0.5) * pano_h
+    equirect_x = (lon / math.pi + 1) / 2 * pano_w
+    equirect_y = (lat / math.pi + 0.5) * pano_h
 
-            # Bilinear sampling
-            x0 = int(equirect_x) % pano_w
-            y0 = max(0, min(int(equirect_y), pano_h - 1))
-            x1 = (x0 + 1) % pano_w
-            y1 = min(y0 + 1, pano_h - 1)
+    # Bilinear sampling
+    x0 = np.astype(equirect_x, np.int32) % pano_w
+    y0 = np.clip(np.astype(equirect_y, np.int32), 0, pano_h - 1)
+    x1 = (x0 + 1) % pano_w
+    y1 = np.minimum(y0 + 1, pano_h - 1)
 
-            fx = equirect_x - int(equirect_x)
-            fy = equirect_y - int(equirect_y)
+    fx = equirect_x - np.floor(equirect_x)
+    fy = equirect_y - np.floor(equirect_y)
 
-            pixel = (
-                pano_arr[y0, x0] * (1 - fx) * (1 - fy)
-                + pano_arr[y0, x1] * fx * (1 - fy)
-                + pano_arr[y1, x0] * (1 - fx) * fy
-                + pano_arr[y1, x1] * fx * fy
-            )
-            out.putpixel((px, py), tuple(pixel.astype(np.uint8)))
+    # Gather and interpolate (HWC image)
+    fx = fx[:, :, np.newaxis]
+    fy = fy[:, :, np.newaxis]
 
+    pixel = (
+        pano_arr[y0, x0] * (1 - fx) * (1 - fy)
+        + pano_arr[y0, x1] * fx * (1 - fy)
+        + pano_arr[y1, x0] * (1 - fx) * fy
+        + pano_arr[y1, x1] * fx * fy
+    )
+
+    out = Image.fromarray(pixel.astype(np.uint8))
     return out
 
 
@@ -136,8 +137,8 @@ class CVCitiesDataset(Dataset):
     Expected directory structure after extraction:
         data_dir/
             seattle/
-                satellite/   (satellite images)
-                streetview/  (panoramic street-view images)
+                sat_images/  or satellite/   (satellite images)
+                pano_images/ or streetview/  (panoramic street-view images)
             london/
                 ...
     """
@@ -163,10 +164,24 @@ class CVCitiesDataset(Dataset):
         self.samples = []
         for city in cities:
             city_dir = self.data_dir / city
-            sat_dir = city_dir / "satellite"
-            street_dir = city_dir / "streetview"
 
-            if not sat_dir.exists() or not street_dir.exists():
+            # Support both CV-Cities naming (sat_images/pano_images)
+            # and original naming (satellite/streetview)
+            sat_dir = None
+            for name in ["sat_images", "satellite"]:
+                candidate = city_dir / name
+                if candidate.exists():
+                    sat_dir = candidate
+                    break
+
+            street_dir = None
+            for name in ["pano_images", "streetview"]:
+                candidate = city_dir / name
+                if candidate.exists():
+                    street_dir = candidate
+                    break
+
+            if sat_dir is None or street_dir is None:
                 continue
 
             sat_files = sorted(sat_dir.glob("*.jpg")) + sorted(sat_dir.glob("*.png"))
