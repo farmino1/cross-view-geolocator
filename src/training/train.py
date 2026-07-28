@@ -135,12 +135,13 @@ def train(
     cities: list[str],
     output_dir: str,
     epochs: int = 50,
-    batch_size: int = 256,
+    batch_size: int = 128,
     lr: float = 3e-4,
     weight_decay: float = 0.2,
     embed_dim: int = 256,
     warmup_epochs: int = 1,
-    checkpoint_interval: int = 10,
+    checkpoint_interval: int = 5,
+    resume_from: str = None,
     device: str = "auto",
 ):
     """
@@ -150,13 +151,14 @@ def train(
         data_dir: path to CV-Cities data directory
         cities: list of city names to use for training
         output_dir: where to save checkpoints and logs
-        epochs: number of training epochs
-        batch_size: batch size (256 recommended for Colab T4)
+        epochs: number of training epochs (total, not additional)
+        batch_size: batch size
         lr: learning rate
         weight_decay: weight decay for AdamW
         embed_dim: embedding dimension (256)
         warmup_epochs: number of warmup epochs
         checkpoint_interval: save checkpoint every N epochs
+        resume_from: path to checkpoint to resume from
         device: 'auto', 'cuda', or 'cpu'
     """
     if device == "auto":
@@ -178,7 +180,6 @@ def train(
     # Loss and optimizer
     criterion = SymmetricInfoNCE(temperature_init=0.07).to(device)
 
-    # Separate parameter groups for encoders vs loss temperature
     params = (
         list(sat_encoder.parameters())
         + list(phone_encoder.parameters())
@@ -195,14 +196,35 @@ def train(
         progress = (step - warmup_epochs) / max(1, epochs - warmup_epochs)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
-    import math
-
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # AMP scaler for mixed precision
     scaler = (
         torch.amp.GradScaler("cuda") if device.type == "cuda" else None
     )
+
+    start_epoch = 0
+    best_recall_1 = 0.0
+    history = []
+
+    # Resume from checkpoint
+    if resume_from and os.path.exists(resume_from):
+        print(f"Resuming from {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        sat_encoder.load_state_dict(ckpt["sat_encoder"])
+        phone_encoder.load_state_dict(ckpt["phone_encoder"])
+        criterion.load_state_dict(ckpt["criterion"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "history" in ckpt:
+            history = ckpt["history"]
+            for h in history:
+                if h.get("recall@1", 0) > best_recall_1:
+                    best_recall_1 = h["recall@1"]
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"  Resumed from epoch {start_epoch}, best R@1: {best_recall_1:.4f}")
 
     # Datasets
     train_dataset = CVCitiesDataset(
@@ -226,7 +248,7 @@ def train(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
     )
@@ -234,19 +256,15 @@ def train(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
     )
 
     print(f"Training: {len(train_dataset)} samples, Validation: {len(val_dataset)} samples")
-    print(f"Device: {device}, Batch size: {batch_size}")
+    print(f"Device: {device}, Batch size: {batch_size}, Epochs: {start_epoch}→{epochs}")
     print(f"Temperature init: {criterion.temperature.item():.4f}")
 
-    # Training loop
-    best_recall_1 = 0.0
-    history = []
-
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         start = time.time()
 
         train_loss = train_epoch(
@@ -301,7 +319,21 @@ def train(
                 f"Time: {elapsed:.1f}s"
             )
 
-        # Periodic checkpoint
+        # Save resume checkpoint every epoch
+        torch.save(
+            {
+                "sat_encoder": sat_encoder.state_dict(),
+                "phone_encoder": phone_encoder.state_dict(),
+                "criterion": criterion.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "epoch": epoch + 1,
+                "history": history,
+            },
+            output_path / "latest_checkpoint.pt",
+        )
+
+        # Periodic full checkpoint
         if (epoch + 1) % checkpoint_interval == 0:
             torch.save(
                 {
