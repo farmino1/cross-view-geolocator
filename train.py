@@ -43,8 +43,22 @@ for city in CITIES:
 
 print("\nDataset ready.")
 for city in CITIES:
-    sat = len(os.listdir(f"{DATA_DIR}/{city}/satellite"))
-    street = len(os.listdir(f"{DATA_DIR}/{city}/streetview"))
+    # CV-Cities zip extracts to sat_images/ and pano_images/
+    city_dir = f"{DATA_DIR}/{city}"
+    for name in ["sat_images", "satellite"]:
+        p = f"{city_dir}/{name}"
+        if os.path.isdir(p):
+            sat = len(os.listdir(p))
+            break
+    else:
+        sat = 0
+    for name in ["pano_images", "streetview"]:
+        p = f"{city_dir}/{name}"
+        if os.path.isdir(p):
+            street = len(os.listdir(p))
+            break
+    else:
+        street = 0
     print(f"  {city}: {sat} satellite, {street} streetview")
 
 # 4. Train teacher encoders (ResNet-50)
