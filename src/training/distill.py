@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -29,7 +30,7 @@ def train_distillation_epoch(
     num_batches = 0
 
     for batch in dataloader:
-        images = batch["satellite"].to(device)  # Use satellite images for distillation
+        images = batch["phone"].to(device)  # Student must encode phone views
 
         optimizer.zero_grad()
 
@@ -65,13 +66,14 @@ def distill(
     batch_size: int = 256,
     lr: float = 1e-4,
     embed_dim: int = 256,
+    resume_from: str = None,
     device: str = "auto",
 ):
     """
     Distill ResNet-50 teacher to MobileNetV3 student.
 
     The teacher's phone encoder embeddings are used as targets.
-    The student learns to produce the same embeddings in a smaller model.
+    The student learns to produce the same embeddings on phone images.
     """
     if device == "auto":
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,6 +107,23 @@ def distill(
 
     scaler = torch.amp.GradScaler("cuda") if device.type == "cuda" else None
 
+    start_epoch = 0
+    best_loss = float("inf")
+
+    # Resume from checkpoint
+    if resume_from and os.path.exists(resume_from):
+        print(f"Resuming from {resume_from}")
+        ckpt = torch.load(resume_from, map_location=device, weights_only=False)
+        student.load_state_dict(ckpt["student"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "scheduler" in ckpt:
+            scheduler.load_state_dict(ckpt["scheduler"])
+        if "best_loss" in ckpt:
+            best_loss = ckpt["best_loss"]
+        start_epoch = ckpt.get("epoch", 0)
+        print(f"  Resumed from epoch {start_epoch}, best loss: {best_loss:.6f}")
+
     # Dataset (only satellite images needed)
     dataset = CVCitiesDataset(
         data_dir,
@@ -118,7 +137,7 @@ def distill(
         dataset,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         drop_last=True,
     )
@@ -126,9 +145,7 @@ def distill(
     print(f"Distillation: {len(dataset)} samples, Teacher: ResNet-50 → Student: MobileNetV3")
     print(f"Device: {device}")
 
-    best_loss = float("inf")
-
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         start = time.time()
         loss = train_distillation_epoch(
             teacher, student, loader, criterion, optimizer, device, scaler
@@ -137,6 +154,18 @@ def distill(
         elapsed = time.time() - start
 
         print(f"Epoch {epoch+1}/{epochs} | Loss: {loss:.6f} | Time: {elapsed:.1f}s")
+
+        # Save resume checkpoint every epoch
+        torch.save(
+            {
+                "student": student.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_loss": best_loss,
+                "epoch": epoch + 1,
+            },
+            output_path / "latest_student.pt",
+        )
 
         if loss < best_loss:
             best_loss = loss
@@ -174,6 +203,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--resume_from", type=str, default=None)
     parser.add_argument("--device", type=str, default="auto")
     args = parser.parse_args()
 
@@ -185,5 +215,6 @@ if __name__ == "__main__":
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
+        resume_from=args.resume_from,
         device=args.device,
     )
